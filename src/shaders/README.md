@@ -73,6 +73,40 @@ stays black, so use a nonblack `$outlinecolor` to make the adjustment visible.
 Future NPR variants should use the same outline HSV control. `PulseGirlsFrontline`
 keeps its current outline system without `$outlinehsv`.
 
+## Stencil and the L4D2 survivor glow
+
+L4D2 writes the survivor glow's interior stencil mask while it draws the entity;
+the halo is then composited only outside that mask. A material shader that calls
+`IShaderDynamicAPI::SetStencilState` during the same draw and then disables
+stencil replaces the engine's state for the meshes that follow. Those meshes stop
+writing the mask, and the whole model fills solid with the glow colour.
+
+`PulseGirlsFrontline`'s `$face`/`$casthairshadow` hair shadow needs stencil, so it
+cannot simply be dropped. The shader saves and restores the engine's state
+instead. The first draw patches the shader API's `SetStencilState` slot (170) with
+a recorder: materialsystem.dll forwards every engine call through that slot
+(`mov eax,[g_pShaderAPI]; mov eax,[eax+0x2A8]; jmp eax`), so each one updates the
+saved `ShaderStencilState_t`. Every hair-shadow pass then puts that saved state
+back when its `Draw()` returns. Our own state changes bypass the recorder, so the
+saved copy is always the engine's, and nothing outside the pass stays changed.
+
+If no engine state has been captured yet - the first frames, or a build where the
+shader API object cannot be hooked - the hair-shadow pass draws nothing instead of
+falling back to disabling stencil: the glow stays correct and the shadow is
+skipped. `-pulse_log` reports `stencil: hook installed`, `stencil: engine state
+captured`, and the per-pass `hairshadow:` lines.
+
+The private stencil bit is `0x04`: L4D2's halo stencil test mask is `0xFA`, which
+includes `0x40` (the bit the pass used to use) and excludes `0x04`. The bit is
+also outside everything the engine writes for the glow mask, so the two never
+collide.
+
+This runtime recorder swaps a virtual-table entry, which upstream's
+`CONTRIBUTING.md` does not allow ("patches a Valve DLL, hooks the engine"). It is
+specific to this fork and must not be proposed upstream as-is. Without the
+recorder the pass skips itself, so removing it only costs the hair shadow - the
+glow stays correct.
+
 ## Adding a variant
 
 Variants are siblings, never subclasses of each other. `BEGIN_INHERITED_SHADER`

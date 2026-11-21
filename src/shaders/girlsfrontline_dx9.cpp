@@ -77,6 +77,37 @@ struct PBR_Vars_t
 };
 
 
+// Survivor glow safety, and how the hair shadow survives it. L4D2 writes the
+// survivor glow's interior stencil mask while it draws the entity, and the halo
+// is only drawn outside that mask. A shader that calls
+// IShaderDynamicAPI::SetStencilState during the same draw - and especially one
+// that ends by disabling stencil - replaces the engine's state for the meshes
+// that follow. Those meshes stop writing the glow mask, the halo is no longer
+// cut out over the body, and the whole model fills solid with the glow colour.
+// That is exactly what $face/$casthairshadow did.
+//
+// Compiling the pass out fixed the glow but took $casthairshadow with it, so the
+// pass now saves and restores the engine's state instead of disabling stencil.
+// SetStencilState has no getter here, but every engine call reaches it through
+// the shader API vtable: materialsystem.dll's own forwarder is
+// `mov eax,[g_pShaderAPI]; mov eax,[eax+0x2A8]; jmp eax`, i.e. slot 170. The
+// first draw therefore installs a hook on that slot and records the last state
+// the engine set. Our own calls bypass the hook, each hair-shadow pass puts the
+// recorded state back when it is done, and nothing outside the pass stays
+// changed.
+//
+// If no engine state has been captured yet, the hair-shadow pass draws nothing
+// rather than falling back to disabling: the glow stays correct and the shadow
+// is simply skipped until the first capture.
+//
+// Known ceiling, unchanged from upstream: hair behind the head still stamps
+// stencil, because Source draws a model's meshes in material order and the face
+// has not written depth when the caster runs, so the depth test cannot reject it.
+// $hairshadowoffset toward the camera keeps most of it off the face.
+#define PULSE_HAIRSHADOW 1
+
+#if PULSE_HAIRSHADOW
+
 // Mirrors ShaderStencilState_t from the SDK's ishaderapi.h. Plain POD: the bool
 // pads to 4, then four enums, the ref value and two masks.
 struct PulseStencilState_t
@@ -103,32 +134,96 @@ enum { PULSE_STENCILFUNC_NEVER = 1, PULSE_STENCILFUNC_EQUAL = 3, PULSE_STENCILFU
 // which is ClearStencilBufferRectangle.
 static const int PULSE_VT_SETSTENCILSTATE = 170;
 
-// Kill switch for the whole feature. Ceiling: hair behind the head still stamps
-// stencil, because Source draws a model's meshes in material order and the face
-// has not written depth when the caster runs, so the depth test cannot reject
-// it. $hairshadowoffset toward the camera keeps most of it off the face.
-#define PULSE_HAIRSHADOW 1
-
 // One bit, so the rest of the stencil buffer stays with whoever else uses it.
-static const int PULSE_STENCIL_HAIRSHADOW = 0x40;
+// L4D2's halo stencil test mask is 0xFA, which includes 0x40 and excludes 0x04,
+// so the hair shadow uses 0x04 (the X360 deferred-shadow bit, unused on the PC
+// dx9 path). That keeps the bit out of the halo's test and leaves whatever the
+// engine writes untouched.
+static const int PULSE_STENCIL_HAIRSHADOW = 0x04;
 
-static void PulseSetStencilState(IShaderDynamicAPI *pShaderAPI, const PulseStencilState_t &state)
+typedef void(__thiscall * PulseSetStencilStateFn)(void *, const PulseStencilState_t *);
+
+static PulseSetStencilStateFn s_pfnSetStencilState = nullptr;
+static void **s_patchedStencilVtable = nullptr;
+static bool s_bStencilHookFailed = false;
+static bool s_bHaveEngineStencil = false;
+static bool s_bLoggedStencilSkip = false;
+static int  s_nEngineStencilLogs = 0;
+static PulseStencilState_t s_EngineStencil;
+
+// windows.h would drag its min/max macros through the Source headers, so the one
+// entry point needed is declared here. kernel32 is already a dependency of the
+// shader DLL, so this adds no import.
+extern "C" __declspec(dllimport) int __stdcall VirtualProtect(void *lpAddress, unsigned long dwSize,
+                                                             unsigned long flNewProtect, unsigned long *lpflOldProtect);
+static const unsigned long PULSE_PAGE_EXECUTE_READWRITE = 0x40;
+
+// Our own calls go straight to the original entry point, which keeps the hook
+// from recording our state as if it were the engine's.
+static void PulseCallSetStencilState(IShaderDynamicAPI *pShaderAPI, const PulseStencilState_t &state)
 {
-    typedef void(__thiscall * SetStencilStateFn)(void *, const PulseStencilState_t *);
+    if (s_pfnSetStencilState)
+    {
+        s_pfnSetStencilState(pShaderAPI, &state);
+        return;
+    }
     void **vt = *(void ***)pShaderAPI;
-    ((SetStencilStateFn)vt[PULSE_VT_SETSTENCILSTATE])(pShaderAPI, &state);
+    ((PulseSetStencilStateFn)vt[PULSE_VT_SETSTENCILSTATE])(pShaderAPI, &state);
 }
 
-static void PulseDisableStencil(IShaderDynamicAPI *pShaderAPI)
+// Records what the engine itself last asked for, then forwards. __fastcall with a
+// throw-away edx keeps the thiscall ABI: `this` in ecx, the state pointer on the
+// stack, and the callee pops those four bytes on return, exactly like the original.
+static void __fastcall PulseStencilHook(void *self, void * /*edx*/, const PulseStencilState_t *state)
 {
-    PulseStencilState_t off;
-    off.m_bEnable = false;
-    off.m_FailOp = off.m_ZFailOp = off.m_PassOp = PULSE_STENCILOP_KEEP;
-    off.m_CompareFunc = PULSE_STENCILFUNC_ALWAYS;
-    off.m_nReferenceValue = 0;
-    off.m_nTestMask = off.m_nWriteMask = 0xFFFFFFFF;
-    PulseSetStencilState(pShaderAPI, off);
+    if (state)
+    {
+        s_EngineStencil = *state;
+        if (!s_bHaveEngineStencil)
+            PulseLog("stencil: engine state captured");
+        s_bHaveEngineStencil = true;
+
+        if (s_nEngineStencilLogs < 3)
+        {
+            ++s_nEngineStencilLogs;
+            PulseLog("stencil: engine state enable=%d fail=%d zfail=%d pass=%d func=%d ref=%d test=0x%X write=0x%X",
+                     (int)state->m_bEnable, state->m_FailOp, state->m_ZFailOp, state->m_PassOp,
+                     state->m_CompareFunc, state->m_nReferenceValue, state->m_nTestMask, state->m_nWriteMask);
+        }
+    }
+    s_pfnSetStencilState(self, state);
 }
+
+// One hook per shader API object; the object is a process-wide singleton, so this
+// normally runs once. A failed VirtualProtect is remembered so the shader stops
+// trying and the hair shadow stays off.
+static void PulseEnsureStencilHook(IShaderDynamicAPI *pShaderAPI)
+{
+    void **vt = *(void ***)pShaderAPI;
+    if (s_patchedStencilVtable == vt || s_bStencilHookFailed)
+        return;
+
+    PulseSetStencilStateFn pfnOriginal =
+        (PulseSetStencilStateFn)vt[PULSE_VT_SETSTENCILSTATE];
+
+    unsigned long oldProtect = 0;
+    if (!VirtualProtect(&vt[PULSE_VT_SETSTENCILSTATE], sizeof(void *),
+                        PULSE_PAGE_EXECUTE_READWRITE, &oldProtect))
+    {
+        s_bStencilHookFailed = true;
+        PulseLog("stencil: hook unavailable (VirtualProtect failed); hair shadow skipped");
+        return;
+    }
+
+    vt[PULSE_VT_SETSTENCILSTATE] = (void *)&PulseStencilHook;
+    VirtualProtect(&vt[PULSE_VT_SETSTENCILSTATE], sizeof(void *), oldProtect, &oldProtect);
+
+    s_pfnSetStencilState = pfnOriginal;
+    s_patchedStencilVtable = vt;
+    PulseLog("stencil: hook installed on slot %d", PULSE_VT_SETSTENCILSTATE);
+}
+
+#endif // PULSE_HAIRSHADOW
 
 // Beginning the shader
 BEGIN_PBR_SHADER(PulseGirlsFrontline, "PBR with optional face shading, stocking, and outline")
@@ -807,71 +902,99 @@ BEGIN_PBR_SHADER(PulseGirlsFrontline, "PBR with optional face shading, stocking,
 
         }
 
+        // L4D2's survivor glow owns the stencil buffer while the entity is
+        // drawn; see the PULSE_HAIRSHADOW comment above. The state the engine
+        // installed is captured through the shader API hook and restored after
+        // every pass, so its glow interior mask survives untouched.
+#if PULSE_HAIRSHADOW
         // The caster stamps PULSE_STENCIL_HAIRSHADOW, the receiver draws only where
-        // that bit stands. Confined to one bit so L4D2's own stencil users - the
-        // survivor glow among them - keep the rest of the buffer.
-        // A participating mesh's main pass clears the bit as well, so anything
-        // drawn over the face un-marks it and the shadow lands on skin the hair
-        // has not covered. The face's own marker runs in pass 2, after its clear.
-        // Materials in neither role never touch stencil: setting and then
-        // blanket-disabling it wipes the interior mask L4D2's survivor glow
-        // writes there, and the whole model fills solid with the glow colour.
+        // that bit stands. A participating mesh's main pass clears the bit as well,
+        // so anything drawn over the face un-marks it and the shadow lands on skin
+        // the hair has not covered. The face's own marker runs in pass 2, after its
+        // clear. Materials in neither role never touch stencil.
         bool bMainPass = pass == 1;
         bool bStencilPass = !IsSnapshotting()
             && (bHairShadow || (bMainPass && (bFace || bCastHairShadow)));
+        PulseStencilState_t engineStencil;
+        bool bStencilSet = false;
         if (bStencilPass)
         {
-            // One shot each: enough to tell a pass that never runs from a stencil
-            // bit that does not survive.
-            static bool s_bLoggedDraw = false, s_bLoggedMark = false;
-            if (bHairShadowDraw && !s_bLoggedDraw)
-            {
-                s_bLoggedDraw = true;
-                PulseLog("hairshadow: DRAWER running, strength=%.2f",
-                         params[info.hairShadowStrength]->GetFloatValue());
-            }
-            if (bHairShadowMark && !s_bLoggedMark)
-            {
-                s_bLoggedMark = true;
-                PulseLog("hairshadow: MARKER running");
-            }
+            PulseEnsureStencilHook(pShaderAPI);
 
-            // Only a fragment that passes both tests touches the bit. Clearing on
-            // ZFail instead would let a hidden fragment wipe a stamp a visible one
-            // just made - overlapping hair strands on the caster, and the inner
-            // mouth behind the face on the receiver, both punch holes that way.
-            PulseStencilState_t st;
-            st.m_bEnable = true;
-            st.m_FailOp = st.m_ZFailOp = PULSE_STENCILOP_KEEP;
-            st.m_nReferenceValue = PULSE_STENCIL_HAIRSHADOW;
-            st.m_nTestMask = PULSE_STENCIL_HAIRSHADOW;
-            st.m_nWriteMask = PULSE_STENCIL_HAIRSHADOW;
-            if (bMainPass)
+            if (s_bHaveEngineStencil)
             {
-                st.m_CompareFunc = PULSE_STENCILFUNC_ALWAYS;
-                st.m_PassOp = PULSE_STENCILOP_ZERO;
+                // Snapshot what the engine last set, put it back when this pass ends.
+                engineStencil = s_EngineStencil;
+
+                // One shot each: enough to tell a pass that never runs from a stencil
+                // bit that does not survive.
+                static bool s_bLoggedDraw = false, s_bLoggedMark = false;
+                if (bHairShadowDraw && !s_bLoggedDraw)
+                {
+                    s_bLoggedDraw = true;
+                    PulseLog("hairshadow: DRAWER running, strength=%.2f",
+                             params[info.hairShadowStrength]->GetFloatValue());
+                }
+                if (bHairShadowMark && !s_bLoggedMark)
+                {
+                    s_bLoggedMark = true;
+                    PulseLog("hairshadow: MARKER running");
+                }
+
+                // Only a fragment that passes both tests touches the bit. Clearing on
+                // ZFail instead would let a hidden fragment wipe a stamp a visible one
+                // just made - overlapping hair strands on the caster, and the inner
+                // mouth behind the face on the receiver, both punch holes that way.
+                PulseStencilState_t st;
+                st.m_bEnable = true;
+                st.m_FailOp = st.m_ZFailOp = PULSE_STENCILOP_KEEP;
+                st.m_nReferenceValue = PULSE_STENCIL_HAIRSHADOW;
+                st.m_nTestMask = PULSE_STENCIL_HAIRSHADOW;
+                st.m_nWriteMask = PULSE_STENCIL_HAIRSHADOW;
+                if (bMainPass)
+                {
+                    st.m_CompareFunc = PULSE_STENCILFUNC_ALWAYS;
+                    st.m_PassOp = PULSE_STENCILOP_ZERO;
+                }
+                else if (bHairShadowMark)
+                {
+                    st.m_CompareFunc = PULSE_STENCILFUNC_ALWAYS;
+                    st.m_PassOp = PULSE_STENCILOP_REPLACE;
+                }
+                else
+                {
+                    // Consume the bit as it is read, so a second hair mesh cannot darken
+                    // the same pixel twice.
+                    st.m_CompareFunc = PULSE_STENCILFUNC_EQUAL;
+                    st.m_PassOp = PULSE_STENCILOP_ZERO;
+                }
+                PulseCallSetStencilState(pShaderAPI, st);
+                bStencilSet = true;
             }
-            else if (bHairShadowMark)
+            else if (!s_bLoggedStencilSkip)
             {
-                st.m_CompareFunc = PULSE_STENCILFUNC_ALWAYS;
-                st.m_PassOp = PULSE_STENCILOP_REPLACE;
+                s_bLoggedStencilSkip = true;
+                PulseLog("hairshadow: no engine stencil state captured yet, shadow pass skipped");
             }
-            else
-            {
-                // Consume the bit as it is read, so a second hair mesh cannot darken
-                // the same pixel twice.
-                st.m_CompareFunc = PULSE_STENCILFUNC_EQUAL;
-                st.m_PassOp = PULSE_STENCILOP_ZERO;
-            }
-            PulseSetStencilState(pShaderAPI, st);
         }
+#endif // PULSE_HAIRSHADOW
 
-        // Actually draw the shader
-        Draw();
+#if PULSE_HAIRSHADOW
+        // Pass 1 carries the material's real draw and must run either way. Pass 2
+        // exists only for the shadow, so without a captured state it draws nothing
+        // instead of an unmasked flat shadow.
+        if (bStencilPass && bHairShadow && !bStencilSet)
+            Draw(false);
+        else
+#endif
+            Draw();
 
-        // Never leave stencil on - the engine's own passes share this state.
-        if (bStencilPass)
-            PulseDisableStencil(pShaderAPI);
+#if PULSE_HAIRSHADOW
+        // Restore the engine's state, whatever it was. Never disable: the glow mask
+        // write depends on the state the engine installed for this entity.
+        if (bStencilSet)
+            PulseCallSetStencilState(pShaderAPI, engineStencil);
+#endif // PULSE_HAIRSHADOW
         }
     };
 
