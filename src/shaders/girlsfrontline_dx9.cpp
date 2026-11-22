@@ -60,6 +60,7 @@ struct PBR_Vars_t
     int faceMapTexture;
     int faceMapTextureTransform;
     int faceMapSmoothness;
+    int faceMapEdgeFeather;
     int noseSpecularStrength;
     int castHairShadow;
     int hairShadowOffset;
@@ -268,6 +269,7 @@ BEGIN_PBR_SHADER(PulseGirlsFrontline, "PBR with optional face shading, stocking,
         SHADER_PARAM(FACEMAPTEXTURE, SHADER_PARAM_TYPE_TEXTURE, "", "Face SDF in R, nose highlight in GB, face mask in A");
         SHADER_PARAM(FACEMAPTEXTURETRANSFORM, SHADER_PARAM_TYPE_MATRIX, "center .5 .5 scale 1 1 rotate 0 translate 0 0", "Face shadow texture coordinate transform");
         SHADER_PARAM(FACEMAPSMOOTHNESS, SHADER_PARAM_TYPE_FLOAT, "0.24", "Face shadow transition width");
+        SHADER_PARAM(FACEMAPEDGEFEATHER, SHADER_PARAM_TYPE_FLOAT, "48", "Width in face-map texels of the blend at the edge of the face mask; 0 keeps the authored hard edge");
         SHADER_PARAM(NOSESPECULARSTRENGTH, SHADER_PARAM_TYPE_FLOAT, "1", "Nose highlight strength");
         SHADER_PARAM(FACEYAW, SHADER_PARAM_TYPE_FLOAT, "270", "Degrees the reference pose faces away from +X. 270 is -Y, what these ports export; 0 is the studiomdl convention");
         SHADER_PARAM(EYELID, SHADER_PARAM_TYPE_BOOL, "0", "Draw over the front hair: for eyelash and eyebrow meshes that read through the bangs");
@@ -341,6 +343,7 @@ BEGIN_PBR_SHADER(PulseGirlsFrontline, "PBR with optional face shading, stocking,
         info.faceMapTexture = FACEMAPTEXTURE;
         info.faceMapTextureTransform = FACEMAPTEXTURETRANSFORM;
         info.faceMapSmoothness = FACEMAPSMOOTHNESS;
+        info.faceMapEdgeFeather = FACEMAPEDGEFEATHER;
         info.noseSpecularStrength = NOSESPECULARSTRENGTH;
         info.castHairShadow = CASTHAIRSHADOW;
         info.hairShadowOffset = HAIRSHADOWOFFSET;
@@ -378,6 +381,7 @@ BEGIN_PBR_SHADER(PulseGirlsFrontline, "PBR with optional face shading, stocking,
 		if (!params[SPECULARTINT]->IsDefined())
 			params[SPECULARTINT]->SetVecValue(1.0f, 1.0f, 1.0f);
         SET_PARAM_FLOAT_IF_NOT_DEFINED(FACEMAPSMOOTHNESS, 0.24f);
+        SET_PARAM_FLOAT_IF_NOT_DEFINED(FACEMAPEDGEFEATHER, 48.0f);
         SET_PARAM_FLOAT_IF_NOT_DEFINED(NOSESPECULARSTRENGTH, 1.0f);
         SET_PARAM_FLOAT_IF_NOT_DEFINED(EYELIDBLEND, 0.5f);
         SET_PARAM_FLOAT_IF_NOT_DEFINED(FACEYAW, 270.0f);
@@ -778,10 +782,17 @@ BEGIN_PBR_SHADER(PulseGirlsFrontline, "PBR with optional face shading, stocking,
 
             else if (bFace)
             {
+                // The feather is expressed in texels but handed to the shader as a mip
+                // level, so it can read a box-filtered copy of the mask (and of the field
+                // near its edge) instead of averaging taps: each level doubles the width of
+                // the filter. 0 keeps mip 0, which is the authored mask and therefore the
+                // pre-feather behaviour.
+                float featherTexels = MIN(MAX(params[info.faceMapEdgeFeather]->GetFloatValue(), 0.0f), 128.0f);
+                float featherLod = featherTexels > 0.0f ? logf(featherTexels) / 0.6931472f : 0.0f;
                 float faceParams[4] = {
                     MAX(params[info.faceMapSmoothness]->GetFloatValue(), 0.0001f),
                     MAX(params[info.noseSpecularStrength]->GetFloatValue(), 0.0f),
-                    0.0f, 0.0f
+                    featherLod, 0.0f
                 };
                 pShaderAPI->SetPixelShaderConstant(19, faceParams, 1);
                 SetVertexShaderTextureTransform(VERTEX_SHADER_SHADER_SPECIFIC_CONST_4,

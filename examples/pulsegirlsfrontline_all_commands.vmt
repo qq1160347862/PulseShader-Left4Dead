@@ -62,6 +62,7 @@
 	$facemaptexture "models/your_model/face_map"                               // Linear map: R face SDF, GB nose highlight, A face mask.
 	$facemaptexturetransform "center .5 .5 scale 1 1 rotate 0 translate 0 0"   // Face map UV transform.
 	$facemapsmoothness "0.24"                                                  // Face shadow transition width; requires $face 1.
+	$facemapedgefeather "48"                                                   // Blend width in face-map texels (0-128) at the mask edge; 0 keeps the hard edge; requires $face 1.
 	$nosespecularstrength "1"                                                  // Nose highlight strength; requires $face 1.
 	$faceyaw "270"                                                             // Reference-pose facing away from +X; 270 is -Y, 0 is studiomdl convention.
 	$eyelid "0"                                                                // Draws lashes or brows over front hair and disables their outline.

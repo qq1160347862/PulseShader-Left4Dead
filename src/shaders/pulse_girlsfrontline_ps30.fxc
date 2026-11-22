@@ -78,7 +78,8 @@ const float4 g_StockingCenterColor_Power        : register(c3);
 const float4 g_StockingFalloffColor             : register(c19);
 #endif
 #if FACE
-// x = transition width, y = nose highlight strength
+// x = transition width, y = nose highlight strength, z = face mask feather as a mip level
+// (0 reads mip 0, i.e. the authored hard mask), w unused.
 const float4 g_FaceParams                       : register(c19);
 // x scales the terminator, y scales ambient. The hair shadow pass redraws the
 // face with both driven down, so the colour comes from $diffuseramptexture rather than
@@ -165,8 +166,13 @@ float faceEdge(float value, float threshold, float transition)
     return saturate((value - threshold) / width + 0.5);
 }
 
-float2 calculateFaceLighting(float2 faceTexCoord, float3 faceRight, float3 faceFront,
-        float3 lightIn, float diffuseFalloff)
+// The authored field is only valid inside the mask, so at the silhouette it falls to 0 as a
+// hard edge of its own. faceField has already been blurred toward the feather level near the
+// edge, which spreads that cut over the same gradient as the mask's and stops it leaking
+// through the feathered coverage as a residual step.
+float2 calculateFaceLighting(float4 directFaceMap, float4 mirroredFaceMap,
+        float2 faceField, float faceRegion,
+        float3 faceRight, float3 faceFront, float3 lightIn, float diffuseFalloff)
 {
     // faceRight and faceFront are orthonormal and lightIn is unit, so these are already
     // the head-space components of a unit vector - no second normalise needed for them.
@@ -182,24 +188,22 @@ float2 calculateFaceLighting(float2 faceTexCoord, float3 faceRight, float3 faceF
 
     float transition = max(g_FaceParams.x, EPSILON);
     float sideBlend = smoothstep(-kFaceCenterTransition, kFaceCenterTransition, lightMapSide);
-    float4 directFaceMap = tex2D(FaceMapSampler, faceTexCoord);
-    float4 mirroredFaceMap = tex2D(FaceMapSampler, float2(1.0 - faceTexCoord.x, faceTexCoord.y));
 
     // The light's side picks which of the mirrored pair to read; the threshold comes from
     // the front component alone, so both halves of the face resolve against the same value.
     // Where the side term is 0 the light is dead front or dead back, the threshold sits at
     // an extreme and both lookups agree, so swapping them there is invisible.
-    float sdf = (lightMapSide < 0.0) ? mirroredFaceMap.r : directFaceMap.r;
+    float sdf = (lightMapSide < 0.0) ? faceField.y : faceField.x;
     float faceShadow = faceEdge(sdf, saturate(-lightDir.y * 0.5 + 0.5), transition);
 
     // Inside the mask the authored field is the whole terminator and stands in for the
     // surface falloff; outside it there is no field to read, so the surface keeps its own.
-    // Alpha covers one half, so the mirrored max recovers the whole face - the mesh
-    // carries neck and ears too.
-    float faceRegion = saturate(max(directFaceMap.a, mirroredFaceMap.a));
+    // faceRegion is feathered toward 0 at the mask edge, so the two meet on a gradient
+    // instead of a step. The mesh carries neck and ears too.
     diffuseFalloff = lerp(diffuseFalloff, faceShadow * frontFalloff, faceRegion);
 
-    // The nose lobes are ours, not the game's, and keep their own [0,1] threshold.
+    // The nose lobes are ours, not the game's, and keep their own [0,1] threshold. They come
+    // from mip 0 because the feather's blur would wash their fine masks out entirely.
     // G and B are two offset fields over the same flank, so their intersection is a band
     // that slides across the bridge as the threshold moves. The map authors one side; the
     // mirrored lookup supplies the other.
@@ -208,8 +212,9 @@ float2 calculateFaceLighting(float2 faceTexCoord, float3 faceRight, float3 faceF
         * faceEdge(directFaceMap.b, 1.0 - noseThreshold, transition);
     float noseMirrored = faceEdge(mirroredFaceMap.g, noseThreshold, transition)
         * faceEdge(mirroredFaceMap.b, 1.0 - noseThreshold, transition);
-    // A highlight inside the face's own terminator has no light to catch.
-    float noseSpec = lerp(noseMirrored, noseDirect, sideBlend) * faceShadow;
+    // A highlight inside the face's own terminator has no light to catch, and it fades with
+    // the region mask so it cannot leave an edge of its own.
+    float noseSpec = lerp(noseMirrored, noseDirect, sideBlend) * faceShadow * faceRegion;
     return float2(diffuseFalloff, noseSpec);
 }
 #endif
@@ -240,6 +245,22 @@ float4 main(PS_INPUT i, float faceSign : VFACE) : COLOR
     float2 faceTexCoord = i.faceTexCoordAndRightXY.xy;
     float3 faceRight = normalize(float3(i.faceTexCoordAndRightXY.zw, i.faceRightZAndFront.x));
     float3 faceFront = normalize(i.faceRightZAndFront.yzw);
+
+    // The face map is read twice: mip 0 carries the fine nose lobes, while the region mask
+    // and the field are read at the feather level (g_FaceParams.z). Blurring the field with
+    // the mask spreads the field's own edge over the same gradient, and the blur fades out
+    // with the mask so the terminator keeps its authored detail in the middle of the face.
+    // All four fetches happen once here, not per light.
+    float4 directFaceMap = tex2D(FaceMapSampler, faceTexCoord);
+    float4 mirroredFaceMap = tex2D(FaceMapSampler, float2(1.0 - faceTexCoord.x, faceTexCoord.y));
+    float faceLod = max(g_FaceParams.z, 0.0);
+    float4 directFaceEdge = tex2Dlod(FaceMapSampler, float4(faceTexCoord, 0.0, faceLod));
+    float4 mirroredFaceEdge = tex2Dlod(FaceMapSampler,
+            float4(1.0 - faceTexCoord.x, faceTexCoord.y, 0.0, faceLod));
+    float faceRegion = saturate(max(directFaceEdge.a, mirroredFaceEdge.a));
+    float faceFieldBlend = 1.0 - saturate(2.0 * faceRegion - 1.0);
+    float2 faceField = float2(lerp(directFaceMap.r, directFaceEdge.r, faceFieldBlend),
+                              lerp(mirroredFaceMap.r, mirroredFaceEdge.r, faceFieldBlend));
 #endif
 
     float4 albedo = tex2D(BaseTextureSampler, correctedTexCoord);
@@ -345,7 +366,8 @@ float4 main(PS_INPUT i, float faceSign : VFACE) : COLOR
 
             float diffuseFalloffOverride = -1.0;
 #if FACE
-            float2 faceLighting = calculateFaceLighting(faceTexCoord, faceRight, faceFront, LightIn,
+            float2 faceLighting = calculateFaceLighting(directFaceMap, mirroredFaceMap,
+                    faceField, faceRegion, faceRight, faceFront, LightIn,
                     openpbrDiffuseFalloff(normal, LightIn, outgoingLightDirection, surface.NoV,
                             surface.diffuseRoughness, g_BaseColor.a != 0.0));
             diffuseFalloffOverride = faceLighting.x;
@@ -399,7 +421,8 @@ float4 main(PS_INPUT i, float faceSign : VFACE) : COLOR
 
         float diffuseFalloffOverride = -1.0;
 #if FACE
-        float2 faceLighting = calculateFaceLighting(faceTexCoord, faceRight, faceFront, flashLightIn,
+        float2 faceLighting = calculateFaceLighting(directFaceMap, mirroredFaceMap,
+                faceField, faceRegion, faceRight, faceFront, flashLightIn,
                 openpbrDiffuseFalloff(normal, flashLightIn, outgoingLightDirection, surface.NoV,
                         surface.diffuseRoughness, g_BaseColor.a != 0.0));
         diffuseFalloffOverride = faceLighting.x;

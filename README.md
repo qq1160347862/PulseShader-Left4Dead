@@ -36,18 +36,25 @@ and ps_3_0 only.
   the glow both work. See
   [Survivor glow compatibility](#survivor-glow-compatibility) and
   [`PULSE_GLOWFIX.md`](PULSE_GLOWFIX.md) (Chinese technical note).
+- **Face SDF edge blending.** `$face` now feathers the region mask through the
+  mask's mip chain (`$facemapedgefeather`, default `48` face-map texels, clamped
+  `0`–`128`, `0` keeps the authored hard edge), so the SDF shading dissolves into
+  the skin at the mask edge instead of ending on a visible cut. That lets
+  `$facemaptexturetransform` go back to aligning the field on the face rather
+  than hiding the seam.
 - **Local build without CMake.** [`build_local.bat`](build_local.bat) produces the
   DLL and the ten `.vcs` archives with the Visual Studio x86 tools directly. Its
   output is the same layout as the official CMake build.
-- **No VMT changes.** No shader parameter was added, removed, or renamed;
-  existing materials work unchanged.
+- **No required VMT changes.** Existing materials work unchanged; the face
+  feather defaults to a useful value and is only worth setting per material if
+  the map's mask edge needs more or less softening. No parameter was removed or
+  renamed.
 
 ## Install
 
-Download the release zip
-(`PulseShader-0.10.0-hairshadow.zip`, built and tested against the retail L4D2
-build), or use your own `dist/` build output, then copy its contents into your
-Left 4 Dead 2 folder:
+Download the latest release zip (`PulseShader-0.10.0-*.zip`, built and tested
+against the retail L4D2 build), or use your own `dist/` build output, then copy
+its contents into your Left 4 Dead 2 folder:
 
 ```text
 <steam>/steamapps/common/Left 4 Dead 2/
@@ -205,7 +212,12 @@ use**. See [`NOTICE`](NOTICE) for provenance and license details.
 - **修复内容**：L4D2 队友蓝色光晕和 Boomer 黄色胆汁光晕不会再「整条剪影被实心填满」；
   `$casthairshadow` 头发阴影同时恢复。原理是记录并恢复引擎的 stencil 状态，
   而不是像上游 0.10.0 那样在绘制中直接改掉/关闭 stencil 状态。细节见 [`PULSE_GLOWFIX.md`](PULSE_GLOWFIX.md)。
-- **安装**：下载 Release 里的 `PulseShader-0.10.0-hairshadow.zip`，解压到
+- **面部 SDF 边缘融合**：`$face` 的遮罩边缘改为按贴图 mip 链羽化
+  （`$facemapedgefeather`，单位 face map texel，默认 48，范围 0–128，0 恢复原来的硬边；
+  2048 宽的图需约翻倍，如 96），SDF 光影在遮罩边界平滑淡入皮肤，
+  不再出现一条硬边色阶；`$facemaptexturetransform` 回到调整 SDF 区域的本职，不必再用来掩盖接缝。
+  现有 VMT 无需改动，默认值即生效。
+- **安装**：下载 Release 里最新的 `PulseShader-0.10.0-*.zip`，解压到
   `steamapps\common\Left 4 Dead 2\`（压缩包内是 `left4dead2\` 结构）。
   DLL 和 10 个 `.vcs` 必须整套替换，不能与别的版本混用。
 - **自行构建**：装好 VS x86 工具、Windows SDK、Python 3、Git Perl 后运行

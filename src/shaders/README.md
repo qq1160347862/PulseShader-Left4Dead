@@ -107,6 +107,38 @@ specific to this fork and must not be proposed upstream as-is. Without the
 recorder the pass skips itself, so removing it only costs the hair shadow - the
 glow stays correct.
 
+## Face SDF region blending
+
+`PulseGirlsFrontline`'s `$face` path reads one map: R is the authored head-space field, G/B
+are the nose lobes, and A is the region mask. The mask is painted as a hard silhouette and
+the field is only valid inside it, so wherever the silhouette falls inside the face UVs the
+SDF term used to stop on a cut and the skin either side of it met at a visible edge. The
+`$facemaptexturetransform` was the only way to move that edge somewhere less obvious, which
+is not what a UV alignment control should be spending its range on.
+
+`$facemapedgefeather` (default `48`, in face-map texels; `0` restores the hard edge) turns
+the step into a gradient. The C++ converts it to a mip level and the shader reads the mask
+from that level of the mip chain: every level is a box average twice as wide as the level
+below, so one fetch blurs over that many texels with a filter that is smooth by construction,
+instead of a tap kernel that would only add banding. The field is read at the same level near
+the silhouette, because its own hard edge there would otherwise leak through the feathered
+coverage as a residual step; that blur fades out with the mask, so the authored terminator
+keeps its detail in the middle of the face. The nose lobes stay on mip 0, the pair max still
+covers both authored halves, and `$facemaptexturetransform` keeps its own meaning: it aligns
+the field on the face and no longer has to hide the mask edge.
+
+The feather works on the mask's mip chain, so the face map needs mipmaps (the game's maps
+have them). A map with no mips keeps the hard edge.
+
+Values are clamped to `0`-`128` texels, which is mip level 7. `0` - or anything below `1` -
+reads mip 0 and reproduces the old hard edge exactly. The unit is a texel of the face map,
+not a screen pixel, so the width follows the map rather than the camera: `48` is about 5% of
+a 1024-wide map and about 6% of the face region the shipped Phaetusa map covers, while a
+2048-wide map needs about twice the value for the same relative softness. A non-power-of-two
+value blends the two adjacent levels, which is slightly smoother than a power of two. Values
+that large are rarely wanted: past about 96 texels the SDF-shaded area itself starts to
+noticeably shrink toward its centre.
+
 ## Adding a variant
 
 Variants are siblings, never subclasses of each other. `BEGIN_INHERITED_SHADER`
